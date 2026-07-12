@@ -33,7 +33,7 @@ import { initRuntime } from "../src/adapters.js";
 // Production modules under test
 import * as store from "../src/store.js";
 import { linkToTripleRecord, tripleRecordToLink, diffToWriteOps, recordToLink, linkContentKey, translateDiffToWrites, shouldFederate, linkOriginKey, linkContentHash, isDuplicate, detectPattern, patternToBlueskyType } from "../src/translate.js";
-import { syncFromPDS, getCursor, setCursor, getSyncStatus } from "../src/sync.js";
+import { syncAll } from "../src/sync.js";
 import { parseSettings, DEFAULT_SETTINGS } from "../src/settings.js";
 import { generateFacets, extractLinks, extractMentions, facetsToLinkPredicates } from "../src/rendering.js";
 import { validateTripleRecord, validateNeighbourhoodRecord, TRIPLE_COLLECTION } from "../src/lexicon.js";
@@ -188,17 +188,22 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("Cross-runtime: Store + Query", () => {
-    it("stores and retrieves a link", () => {
+    /** Commit a single addition to the local repo. */
+    function add(link: LinkExpression): string {
+        return store.applyLocalDiff({ additions: [link], removals: [] });
+    }
+
+    it("commits and retrieves a link", () => {
         const link = makeLinkExpression();
-        const h = store.putLink(link);
-        const retrieved = store.getLink(h);
-        assert.ok(retrieved);
-        assert.equal(retrieved!.data.source, "literal://hello");
+        add(link);
+        const results = store.queryLinks({ source: "literal://hello" });
+        assert.equal(results.length, 1);
+        assert.equal(results[0].data.source, "literal://hello");
     });
 
     it("queries links by source", () => {
-        store.putLink(makeLinkExpression());
-        store.putLink(makeLinkExpression({
+        add(makeLinkExpression());
+        add(makeLinkExpression({
             data: { source: "other://source", target: "t", predicate: "p" },
         }));
 
@@ -208,8 +213,8 @@ describe("Cross-runtime: Store + Query", () => {
     });
 
     it("queries links by predicate", () => {
-        store.putLink(makeLinkExpression());
-        store.putLink(makeLinkExpression({
+        add(makeLinkExpression());
+        add(makeLinkExpression({
             data: { source: "s", target: "t", predicate: "flux://has_message" },
         }));
 
@@ -218,14 +223,14 @@ describe("Cross-runtime: Store + Query", () => {
     });
 
     it("queries links by target", () => {
-        store.putLink(makeLinkExpression());
+        add(makeLinkExpression());
         const results = store.queryLinks({ target: "literal://world" });
         assert.equal(results.length, 1);
     });
 
     it("returns all links with no filter", () => {
-        store.putLink(makeLinkExpression());
-        store.putLink(makeLinkExpression({
+        add(makeLinkExpression());
+        add(makeLinkExpression({
             data: { source: "s2", target: "t2", predicate: "p2" },
         }));
 
@@ -233,24 +238,24 @@ describe("Cross-runtime: Store + Query", () => {
         assert.equal(results.length, 2);
     });
 
-    it("removes a link and its indexes", () => {
+    it("removes a link via a tombstone commit", () => {
         const link = makeLinkExpression();
-        store.putLink(link);
-        store.removeLink(link);
+        add(link);
+        store.applyLocalDiff({ additions: [], removals: [link] });
 
         const results = store.queryLinks({ source: "literal://hello" });
         assert.equal(results.length, 0);
     });
 
-    it("applies a diff (additions + removals)", () => {
+    it("applies a diff (additions + removals) in one commit", () => {
         const existing = makeLinkExpression();
-        store.putLink(existing);
+        add(existing);
 
         const newLink = makeLinkExpression({
             data: { source: "new", target: "link", predicate: "pred" },
         });
 
-        store.applyDiff({
+        store.applyLocalDiff({
             additions: [newLink],
             removals: [existing],
         });
@@ -259,9 +264,9 @@ describe("Cross-runtime: Store + Query", () => {
         assert.equal(store.queryLinks({ source: "new" }).length, 1);
     });
 
-    it("allLinks returns all stored links", () => {
-        store.putLink(makeLinkExpression());
-        store.putLink(makeLinkExpression({
+    it("allLinks returns all folded links", () => {
+        add(makeLinkExpression());
+        add(makeLinkExpression({
             data: { source: "s2", target: "t2", predicate: "p2" },
         }));
 
@@ -271,14 +276,16 @@ describe("Cross-runtime: Store + Query", () => {
 
     it("linkCount returns correct count", () => {
         assert.equal(store.linkCount(), 0);
-        store.putLink(makeLinkExpression());
+        add(makeLinkExpression());
         assert.equal(store.linkCount(), 1);
     });
 
-    it("revision tracking works", () => {
-        assert.equal(store.getRevision(), null);
-        store.setRevision("rev-1");
-        assert.equal(store.getRevision(), "rev-1");
+    it("revision is the empty string before any commit and a CID after", () => {
+        assert.equal(store.getRevision(), "");
+        add(makeLinkExpression());
+        const rev = store.getRevision();
+        assert.ok(rev.length > 0, "revision should be a non-empty commit CID");
+        assert.equal(rev, store.getLocalHead(), "solo revision is the local commit CID");
     });
 
     it("peer management works", () => {
@@ -364,80 +371,87 @@ describe("Cross-runtime: Translation + Write Ops", () => {
 // ---------------------------------------------------------------------------
 
 describe("Cross-runtime: Sync from PDS", () => {
-    it("syncs records from mock transport", async () => {
-        mockTransport.addResponse("listRecords", {
+    /** Wire a repo head + its per-collection record listings into the mock. */
+    function wireRepo(head: string, tripleRecords: unknown[], tombstoneRecords: unknown[] = []) {
+        mockTransport.addResponse("com.atproto.sync.getLatestCommit", {
             status: 200,
             headers: {},
-            body: JSON.stringify({
-                records: [
-                    {
-                        uri: "at://did:plc:abc/ad4m.link.triple/123",
-                        cid: "cid1",
-                        value: {
-                            $type: "ad4m.link.triple",
-                            source: "remote://source",
-                            predicate: "remote://predicate",
-                            target: "remote://target",
-                            author: "did:key:remote",
-                            timestamp: "2026-05-02T06:00:00.000Z",
-                        },
-                    },
-                ],
-            }),
+            body: JSON.stringify({ cid: head, rev: "3kaaa" }),
         });
+        mockTransport.addResponse("collection=ad4m.link.triple", {
+            status: 200,
+            headers: {},
+            body: JSON.stringify({ records: tripleRecords }),
+        });
+        mockTransport.addResponse("collection=ad4m.link.tombstone", {
+            status: 200,
+            headers: {},
+            body: JSON.stringify({ records: tombstoneRecords }),
+        });
+    }
 
-        const diff = await syncFromPDS({
+    it("syncs records from mock transport by riding the commit head", async () => {
+        wireRepo("bafyhead1", [
+            {
+                uri: "at://did:plc:abc/ad4m.link.triple/123",
+                cid: "cid1",
+                value: {
+                    $type: "ad4m.link.triple",
+                    source: "remote://source",
+                    predicate: "remote://predicate",
+                    target: "remote://target",
+                    author: "did:key:remote",
+                    timestamp: "2026-05-02T06:00:00.000Z",
+                },
+            },
+        ]);
+
+        const diff = await syncAll({
             pdsUrl: "https://pds.example.com",
             accessJwt: "mock-jwt",
             repo: "did:plc:abc",
-            collection: "ad4m.link.triple",
-            neighbourhoodUrl: "neighbourhood://test",
         });
 
         assert.equal(diff.additions.length, 1);
         assert.equal(diff.additions[0].data.source, "remote://source");
         assert.equal(diff.additions[0].author, "did:key:remote");
 
-        // Verify stored in local store
+        // Verify materialised in the folded link set.
         const allLinks = store.allLinks();
         assert.equal(allLinks.links.length, 1);
+
+        // The local head now equals the PDS-reported commit CID.
+        assert.equal(store.getLocalHead(), "bafyhead1");
     });
 
-    it("sets origin tracking for synced records", async () => {
-        mockTransport.addResponse("listRecords", {
-            status: 200,
-            headers: {},
-            body: JSON.stringify({
-                records: [
-                    {
-                        uri: "at://did:plc:abc/ad4m.link.triple/123",
-                        cid: "cid1",
-                        value: {
-                            $type: "ad4m.link.triple",
-                            source: "s",
-                            predicate: "p",
-                            target: "t",
-                            author: "did:key:z6Mk1",
-                            timestamp: "2026-05-02T00:00:00.000Z",
-                        },
-                    },
-                ],
-            }),
-        });
+    it("skips a repo whose head is unchanged since last sync", async () => {
+        wireRepo("bafyhead-stable", [
+            {
+                uri: "at://did:plc:abc/ad4m.link.triple/123",
+                cid: "cid1",
+                value: {
+                    $type: "ad4m.link.triple",
+                    source: "s",
+                    predicate: "p",
+                    target: "t",
+                    author: "did:key:z6Mk1",
+                    timestamp: "2026-05-02T00:00:00.000Z",
+                },
+            },
+        ]);
 
-        await syncFromPDS({
-            pdsUrl: "https://pds.example.com",
-            accessJwt: "mock-jwt",
-            repo: "did:plc:abc",
-            collection: "ad4m.link.triple",
-            neighbourhoodUrl: "neighbourhood://test",
-        });
+        const opts = { pdsUrl: "https://pds.example.com", accessJwt: "mock-jwt", repo: "did:plc:abc" };
+        await syncAll(opts);
+        const beforeCount = mockTransport.requests.length;
 
-        // Check that origin was tracked
-        const link = store.allLinks().links[0];
-        const linkHash = simpleHash(linkContentKey(link));
-        const origin = mockStorage.get(linkOriginKey(linkHash));
-        assert.equal(origin, "atproto");
+        // Second sync: head unchanged → no listRecords, empty delta.
+        const diff2 = await syncAll(opts);
+        assert.equal(diff2.additions.length, 0);
+        assert.equal(diff2.removals.length, 0);
+
+        // Only the head check should have gone out (one request), no listRecords.
+        const newRequests = mockTransport.requests.slice(beforeCount);
+        assert.ok(newRequests.every(r => !r.url.includes("listRecords")), "no listRecords on unchanged head");
     });
 });
 
@@ -466,9 +480,9 @@ describe("Cross-runtime: Full round-trip", () => {
         assert.equal(reconstructed.data.target, original.data.target);
         assert.equal(reconstructed.author, original.author);
 
-        // Step 3: Store
-        const h = store.putLink(reconstructed);
-        assert.ok(h);
+        // Step 3: Commit
+        const head = store.applyLocalDiff({ additions: [reconstructed], removals: [] });
+        assert.ok(head);
 
         // Step 4: Query
         const results = store.queryLinks({ predicate: "flux://has_message" });
