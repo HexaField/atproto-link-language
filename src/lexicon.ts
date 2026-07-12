@@ -68,6 +68,64 @@ export const AD4M_LINK_TRIPLE_LEXICON = {
 } as const;
 
 /**
+ * ad4m.link.tombstone Lexicon schema.
+ *
+ * A first-class removal record. It carries the ORIGINAL link's content hash
+ * (`linkHash`) so that a deletion in one repo converges against the addition
+ * of that exact link in another repo, under the cross-repo OR-Set. The
+ * removed triple is echoed for human/native readers but the `linkHash` is
+ * what the OR-Set matches on.
+ */
+export const AD4M_LINK_TOMBSTONE_LEXICON = {
+    lexicon: 1,
+    id: "ad4m.link.tombstone",
+    revision: 1,
+    description: "A first-class AD4M link removal carrying the original link's content hash.",
+    defs: {
+        main: {
+            type: "record",
+            key: "tid",
+            record: {
+                type: "object",
+                required: ["linkHash", "author", "timestamp"],
+                properties: {
+                    linkHash: {
+                        type: "string",
+                        maxLength: 256,
+                        description: "Content hash of the removed link (the OR-Set element key)",
+                    },
+                    source: {
+                        type: "string",
+                        maxLength: 4096,
+                        description: "Source URI of the removed link (echo, informational)",
+                    },
+                    predicate: {
+                        type: "string",
+                        maxLength: 1024,
+                        description: "Predicate URI of the removed link (echo, informational)",
+                    },
+                    target: {
+                        type: "string",
+                        maxLength: 4096,
+                        description: "Target URI of the removed link (echo, informational)",
+                    },
+                    author: {
+                        type: "string",
+                        maxLength: 512,
+                        description: "DID of the agent performing the removal",
+                    },
+                    timestamp: {
+                        type: "string",
+                        format: "datetime",
+                        description: "ISO-8601 timestamp of the removal",
+                    },
+                },
+            },
+        },
+    },
+} as const;
+
+/**
  * ad4m.link.neighbourhood Lexicon schema.
  * Metadata record for an AD4M Neighbourhood on AT Protocol.
  */
@@ -100,8 +158,27 @@ export const AD4M_LINK_NEIGHBOURHOOD_LEXICON = {
 /** Collection NSID for native triples */
 export const TRIPLE_COLLECTION = "ad4m.link.triple";
 
+/** Collection NSID for first-class removals (tombstones) */
+export const TOMBSTONE_COLLECTION = "ad4m.link.tombstone";
+
 /** Collection NSID for neighbourhood metadata */
 export const NEIGHBOURHOOD_COLLECTION = "ad4m.link.neighbourhood";
+
+/**
+ * Validate a record against the ad4m.link.tombstone schema.
+ * Returns true if the record has all required fields with correct types.
+ */
+export function validateTombstoneRecord(record: Record<string, unknown>): boolean {
+    if (typeof record.linkHash !== "string") return false;
+    if (typeof record.author !== "string") return false;
+    if (typeof record.timestamp !== "string") return false;
+    if (record.linkHash.length === 0 || record.linkHash.length > 256) return false;
+    if (record.author.length > 512) return false;
+    if (record.source !== undefined && typeof record.source !== "string") return false;
+    if (record.predicate !== undefined && typeof record.predicate !== "string") return false;
+    if (record.target !== undefined && typeof record.target !== "string") return false;
+    return true;
+}
 
 /**
  * Validate a record against the ad4m.link.triple schema.

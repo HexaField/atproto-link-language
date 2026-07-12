@@ -13,10 +13,11 @@
  * - Dual-language deduplication and origin tracking (was dual-language.ts)
  */
 
-import type { LinkExpression, PerspectiveDiff, RepoWrite, Ad4mLinkTriple, BskyPost, BskyLike, BskyRepost, BskyFollow, ExpressionProof } from "./types.js";
+import type { LinkExpression, PerspectiveDiff, RepoWrite, Ad4mLinkTriple, Ad4mLinkTombstone, BskyPost, BskyLike, BskyRepost, BskyFollow, ExpressionProof } from "./types.js";
 import type { ATProtoSettings } from "./settings.js";
 import { generateFacets } from "./rendering.js";
 import { tidFromISO } from "./xrpc.js";
+import { TOMBSTONE_COLLECTION } from "./lexicon.js";
 
 // ---------------------------------------------------------------------------
 // Pure translation functions (was translate.pure.ts)
@@ -457,6 +458,74 @@ export function linkOriginKey(linkHash: string): string {
     return `link-origin/${linkHash}`;
 }
 
+// ---------------------------------------------------------------------------
+// Canonical link identity (OR-Set element key)
+// ---------------------------------------------------------------------------
+
+/**
+ * Canonical serialization of a link's FULL identity — triple + author +
+ * timestamp. This is the OR-Set element: two adds of the same triple by
+ * different authors (or at different times) are *distinct* elements, and a
+ * tombstone matches the exact observed link. (This is stronger than
+ * {@link linkContentKey}, which covers only source/predicate/target and is
+ * used for the dual-language echo filter.)
+ */
+export function canonicalLinkIdentity(link: LinkExpression): string {
+    return JSON.stringify({
+        source: link.data.source ?? null,
+        predicate: link.data.predicate ?? null,
+        target: link.data.target ?? null,
+        author: link.author,
+        timestamp: link.timestamp,
+    });
+}
+
+/**
+ * The OR-Set element key for a link: a content hash over its full identity.
+ * Both an addition (the `ad4m.link.triple` record) and a removal (the
+ * `ad4m.link.tombstone` record's `linkHash`) key on this exact value, so a
+ * removal in one repo converges against the add in another.
+ */
+export function linkHash(link: LinkExpression, hashFn: (data: string) => string): string {
+    return hashFn(canonicalLinkIdentity(link));
+}
+
+// ---------------------------------------------------------------------------
+// Tombstones (first-class removals carrying the original link hash)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a tombstone record for a removed link. The `linkHash` is the
+ * original link's OR-Set element key (see {@link linkHash}); the echoed
+ * triple is informational only.
+ */
+export function linkToTombstoneRecord(
+    link: LinkExpression,
+    hashFn: (data: string) => string,
+): Ad4mLinkTombstone {
+    return {
+        $type: "ad4m.link.tombstone",
+        linkHash: linkHash(link, hashFn),
+        source: link.data.source || undefined,
+        predicate: link.data.predicate || undefined,
+        target: link.data.target || undefined,
+        author: link.author,
+        timestamp: link.timestamp,
+    };
+}
+
+/** True if a record is an ad4m.link.tombstone. */
+export function isTombstoneRecord(record: Record<string, unknown>): boolean {
+    return record.$type === "ad4m.link.tombstone";
+}
+
+/** Extract the original link hash a tombstone record removes. */
+export function tombstoneLinkHash(record: Record<string, unknown>): string | null {
+    if (!isTombstoneRecord(record)) return null;
+    const h = record.linkHash;
+    return typeof h === "string" && h.length > 0 ? h : null;
+}
+
 export function shouldFederate(
     linkHash: string,
     getOrigin: (key: string) => string | null,
@@ -566,12 +635,27 @@ export function translateDiffToWrites(
     }
 
     for (const link of diff.removals) {
-        const linkHash = hashFn(linkContentKey(link));
-        if (!shouldFederate(linkHash)) continue;
+        const originHash = hashFn(linkContentKey(link));
+        if (!shouldFederate(originHash)) continue;
 
         const rkey = linkToRkey(link);
 
         if (strategy === "native" || strategy === "dual") {
+            // First-class removal: write an ad4m.link.tombstone record carrying
+            // the ORIGINAL link hash so a delete here converges against the add
+            // in another repo under the cross-repo OR-Set. The tombstone shares
+            // the removed link's OR-Set hash as its rkey so it co-locates with
+            // (and is idempotent against) the add it removes.
+            const tombstone = linkToTombstoneRecord(link, hashFn);
+            writes.push({
+                $type: "com.atproto.repo.applyWrites#create",
+                collection: TOMBSTONE_COLLECTION,
+                rkey: tombstone.linkHash,
+                value: tombstone as unknown as Record<string, unknown>,
+            });
+
+            // Also delete the local triple record so the repo listing no longer
+            // carries the add (the OR-Set element is the tombstone from here on).
             writes.push({
                 $type: "com.atproto.repo.applyWrites#delete",
                 collection,

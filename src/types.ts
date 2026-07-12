@@ -66,6 +66,19 @@ export interface Ad4mLinkTriple {
     };
 }
 
+/** AT Proto ad4m.link.tombstone record — a first-class removal */
+export interface Ad4mLinkTombstone {
+    $type: "ad4m.link.tombstone";
+    /** Content hash of the removed link (the OR-Set element key). */
+    linkHash: string;
+    /** Echoed triple (informational). */
+    source?: string;
+    predicate?: string;
+    target?: string;
+    author: string;
+    timestamp: string;
+}
+
 /** AT Proto ad4m.link.neighbourhood record */
 export interface Ad4mLinkNeighbourhood {
     $type: "ad4m.link.neighbourhood";
