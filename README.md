@@ -12,14 +12,18 @@ convergence over a hash-linked diff-DAG) rather than faking it with a snapshot.
 ## How Convergence Works
 
 AD4M drives two roles through a link language. This language keeps them strictly
-separated:
+separated (the two-channel split — see also "Role B — native projection" below):
 
-- **Convergence substrate (source of truth).** The AT repo's MST commit-chain.
-  Every commit is a real `CIDv1(dag-cbor, sha-256)` over the record set. Adds and
-  removes are *records*, and convergence is decided by set algebra over record
-  content-hashes — never by reading a projection back.
-- **Native projection (derived, lossy).** Bluesky-shaped facets/embeds
-  (`src/rendering.ts`). Produced *from* the substrate; never read back as truth.
+- **Channel A — convergence substrate (source of truth).** The AT repo's MST
+  commit-chain. Every commit is a real `CIDv1(dag-cbor, sha-256)` over the record
+  set. Adds and removes are *records* (`ad4m.link.triple` / `ad4m.link.tombstone`),
+  and convergence is decided by set algebra over record content-hashes — never by
+  reading a projection back. Channel A publishes the WHOLE perspective (every link
+  and all SDNA) on every commit, independent of the rendering strategy.
+- **Channel B — native projection (derived, lossy).** A SHACL-driven rendering of
+  AD4M subject-class instances into native `app.bsky.feed.post` records
+  (`src/projection/` + `src/atproto-projection.ts`), so native Bluesky clients
+  display them. Produced *from* Channel A; never read back as truth.
 
 ### Revision = commit-CID, not a cursor
 
@@ -77,6 +81,38 @@ present links = ⋃ (adds across all repos)  \  ⋃ (tombstones across all repos
   repo's state (`store.ingestPeerRecords`) and the resulting fold delta is emitted
   to AD4M — the projection is re-derived by folding, never read back.
 
+## Role B — native projection (SHACL-driven)
+
+Channel A gives AD4M genuine convergence, but its records
+(`ad4m.link.triple` / `ad4m.link.tombstone`) are invisible to a native Bluesky
+client. Role B closes that gap: it renders AD4M subject-class instances into real
+`app.bsky.feed.post` records so the timeline shows up in any Bluesky app — while
+keeping the DAG strictly on Channel A.
+
+- **SHACL decides the shape, the adapter knows Bluesky.** A projection profile
+  (parsed from the perspective's SDNA by `src/projection/profile.ts`, else the
+  built-in `defaultFluxMessageProfile`) says *which* graph property fills the
+  post and *which* native record type to emit. `src/atproto-projection.ts` is the
+  only Bluesky-schema-aware half: it maps the resulting `Projection` to an
+  `app.bsky.feed.post` whose `text` is the projected content field and whose
+  `createdAt` is the instance timestamp.
+- **Projection is derived and lossy — never read back.** `toNative` emits **only**
+  native post fields: no `ad4m` envelope, no link hashes, no triple data smuggled
+  into `text`. When a diff is committed and the rendering strategy is not
+  `native`, `projectInstances` folds the additions into posts and writes them
+  alongside the Channel-A substrate; the DAG is never rebuilt from a post.
+- **Native ingest — only for pure-Bluesky authors.** During `sync`, after folding
+  Channel A, posts authored in peer repos that have **no** AD4M footprint (a DID
+  that is neither the local repo nor any repo carrying `ad4m.link.*` records) are
+  reversed by `ingestNative` into fresh authoritative links and published back
+  through Channel A. A repo that already writes triples is skipped — its posts are
+  its own Role-B projection, so re-ingesting them would echo. Ingested AT-URIs are
+  remembered for idempotency.
+
+The result is a clean split: Channel A is the whole, authoritative, converging
+perspective; Channel B is a one-way human-facing rendering of it (plus a
+one-way on-ramp for content that was only ever native).
+
 ## Content-Addressing Stack
 
 The DAG-CBOR + sha-256 + CIDv1 stack is implemented pure, in-tree (no
@@ -112,7 +148,7 @@ Requires `@coasys/ad4m-ldk` at `../ad4m/ad4m-ldk/js/` or set `AD4M_LDK_ENTRY`.
 node --experimental-vm-modules --import tsx --test tests/*.test.ts
 ```
 
-282 tests across 13 test files, all passing. The convergence core is unit-tested
+326 tests across 15 test files, all passing. The convergence core is unit-tested
 against fixtures:
 
 - `tests/cid.test.ts` — DAG-CBOR / sha-256 / CIDv1, incl. the empty-map
@@ -125,6 +161,13 @@ against fixtures:
   concurrent remove-wins, order-independent merge, projection-derived-by-fold.
 - `tests/sync.test.ts` — the MST-diff sync layer (`diffRepoRecords`, `syncRepo`
   head-riding + unchanged-head skip, `syncAll` fold delta).
+- `tests/projection.test.ts` — the Channel-B SHACL stack: literal codec, node
+  expressions, `parseProfiles`, instance collection + projection, native
+  round-trip, and the ATProto adapter (`toNative` emits a clean
+  `app.bsky.feed.post`; `fromNative` reverses a located post).
+- `tests/channel-b-bridge.test.ts` — the protocol-agnostic bridge glue
+  (`toAuthoredLink`, `projectInstances`, `ingestNative`, the Flux fallback
+  profile) exercised over the ATProto post adapter.
 
 ### What needs a live PDS / federation
 
@@ -152,6 +195,14 @@ OR-Set union, and the fold — is fully unit-tested against fixtures above.
 - `src/auth.ts` — app-password authentication + session refresh.
 - `src/translate.ts` — link ↔ AT record translation, incl. first-class tombstones,
   dual-language handling, and SDNA link projection.
+- `src/projection/` — protocol-agnostic Channel-B core: the SHACL profile parser
+  + node-expression evaluator (`profile.ts`, `expression.ts`), the AD4M literal
+  codec (`literal.ts`), the graph → `Projection` transformer (`project.ts`), and
+  the bridge glue (`bridge.ts`: `projectInstances` / `ingestNative` /
+  `defaultFluxMessageProfile`). Identical across every plain-text link language.
+- `src/atproto-projection.ts` — the ATProto `NativeAdapter`: the only
+  Bluesky-schema-aware half, mapping a `Projection` to/from an
+  `app.bsky.feed.post` record (content field `text`).
 - `src/lexicon.ts` — custom Lexicon definitions.
 - `src/rendering.ts` — Bluesky facet / embed projection.
 - `src/settings.ts` — language settings.
