@@ -192,6 +192,35 @@ export function buildResolveHandleRequest(
     };
 }
 
+/**
+ * `com.atproto.sync.getLatestCommit` — returns a repo's current signed commit
+ * `{ cid, rev }`. The `cid` is the head commit CID; this is the real content
+ * hash the sync layer diffs against (rather than a listRecords cursor).
+ */
+export function buildGetLatestCommitRequest(
+    pdsUrl: string,
+    did: string,
+): XrpcRequest {
+    return {
+        url: `${pdsUrl}/xrpc/com.atproto.sync.getLatestCommit?did=${encodeURIComponent(did)}`,
+        method: "GET",
+        headers: {},
+        body: "",
+    };
+}
+
+export function parseGetLatestCommitResponse(body: string): { cid: string; rev: string } | null {
+    try {
+        const data = JSON.parse(body);
+        if (typeof data.cid === "string") {
+            return { cid: data.cid, rev: typeof data.rev === "string" ? data.rev : "" };
+        }
+        return null;
+    } catch {
+        return null;
+    }
+}
+
 export function buildCreateRecordRequest(
     pdsUrl: string,
     token: string,
@@ -432,6 +461,27 @@ export async function resolveHandle(
         return parseResolveHandleResponse(response.body);
     }
     console.error(`[xrpc] resolveHandle failed: ${response.status} ${response.body}`);
+    return null;
+}
+
+/**
+ * Fetch a repo's current signed commit head `{ cid, rev }`.
+ *
+ * The returned `cid` is the head commit CID — the real content hash the sync
+ * layer rides. When it is unchanged since the last sync, the repo has no new
+ * links and no records need to be re-fetched.
+ */
+export async function getLatestCommit(
+    pdsUrl: string,
+    did: string,
+): Promise<{ cid: string; rev: string } | null> {
+    const req = buildGetLatestCommitRequest(pdsUrl, did);
+    const response = await getTransport().fetch(req.url, req.method, req.headers, req.body);
+
+    if (response.status >= 200 && response.status < 300) {
+        return parseGetLatestCommitResponse(response.body);
+    }
+    console.error(`[xrpc] getLatestCommit failed: ${response.status} ${response.body}`);
     return null;
 }
 

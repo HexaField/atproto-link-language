@@ -23,12 +23,11 @@ import {
 import type { PerspectiveDiff, LinkExpression } from "./src/types.js";
 import { parseSettings } from "./src/settings.js";
 import type { ATProtoSettings } from "./src/settings.js";
-import { translateDiffToWrites, linkContentKey, shouldFederate, linkOriginKey, linkContentHash } from "./src/translate.js";
-import type { LinkOrigin } from "./src/translate.js";
+import { translateDiffToWrites, shouldFederate, linkOriginKey } from "./src/translate.js";
 import * as store from "./src/store.js";
 import * as xrpc from "./src/xrpc.js";
-import { authenticate, getAccessToken, getStoredDid } from "./src/auth.js";
-import { syncFromPDS, initialSync } from "./src/sync.js";
+import { authenticate, getAccessToken } from "./src/auth.js";
+import { syncAll } from "./src/sync.js";
 import { TRIPLE_COLLECTION } from "./src/lexicon.js";
 
 // Adapter imports
@@ -102,6 +101,10 @@ const language = defineLanguage({
         myDid = agentDid();
         settings = parseSettings(languageSettings());
 
+        // Bind the local repo (and thus its commit CID) to this agent's DID.
+        const localRepoDid = AT_DID !== "<to-be-filled>" ? AT_DID : myDid;
+        store.setLocalDid(localRepoDid);
+
         console.log(`[atproto-link-language] init: did=${myDid}, pds=${AT_PDS_URL}`);
         console.log(`[atproto-link-language] AT DID: ${AT_DID}`);
         console.log(`[atproto-link-language] sync mode: ${settings.syncMode}`);
@@ -116,16 +119,15 @@ const language = defineLanguage({
                 const auth = await authenticate(AT_PDS_URL, handle, appPassword);
                 if (auth) {
                     console.log(`[atproto-link-language] authenticated as ${auth.did}`);
-                    // Initial sync if no cursor exists
-                    if (!getStorage().get("at:sync:cursor")) {
-                        const diff = await initialSync({
+                    store.setLocalDid(auth.did);
+                    // Initial convergence: ride each repo's commit head via MST diff.
+                    if (settings.syncMode !== "publish-only") {
+                        const diff = await syncAll({
                             pdsUrl: AT_PDS_URL,
                             accessJwt: auth.accessJwt,
                             repo: auth.did,
-                            collection: collectionNsid(),
-                            neighbourhoodUrl: neighbourhoodUrl(),
                         });
-                        if (diff.additions.length > 0) {
+                        if (diff.additions.length > 0 || diff.removals.length > 0) {
                             emitPerspectiveDiff(diff);
                         }
                     }
@@ -143,22 +145,21 @@ const language = defineLanguage({
         console.log("[atproto-link-language] teardown");
     },
 
-    interactions() {
-        return [];
-    },
-
     // -----------------------------------------------------------------------
     // perspective-commit
     // -----------------------------------------------------------------------
     commit: {
         async commit(diff: PerspectiveDiff) {
-            // 1. Store links locally
-            store.applyDiff(diff);
+            // 1. Apply to the local MST commit chain: additions become
+            //    ad4m.link.triple records, removals become ad4m.link.tombstone
+            //    records carrying the original link hash. This advances the
+            //    local commit CID — the head we return as the new revision.
+            const newHead = store.applyLocalDiff(diff);
 
             // 2. Skip outbound in subscribe-only mode
             if (settings.syncMode === "subscribe-only") {
                 emitPerspectiveDiff(diff);
-                return "";
+                return newHead;
             }
 
             // 3. Build federation filter
@@ -210,7 +211,8 @@ const language = defineLanguage({
             // 7. Emit perspective diff for local subscribers
             emitPerspectiveDiff(diff);
 
-            return "";
+            // The new revision is the local repo's advanced commit CID.
+            return newHead;
         },
     },
 
@@ -229,21 +231,26 @@ const language = defineLanguage({
                 return { additions: [], removals: [] };
             }
 
-            return await syncFromPDS({
+            // Ride each participating repo's commit head (self + peers) via MST
+            // diff, converge via the cross-repo OR-Set, and return the delta.
+            return await syncAll({
                 pdsUrl: AT_PDS_URL,
                 accessJwt: auth.accessJwt,
                 repo: auth.did,
-                collection: collectionNsid(),
-                neighbourhoodUrl: neighbourhoodUrl(),
             });
         },
 
         async render() {
+            // Role B projection: derived from the substrate fold, never read
+            // back from a materialised store.
             return store.allLinks();
         },
 
         async currentRevision() {
-            return store.getRevision() || "";
+            // The version-vector digest of every participating repo's commit
+            // CID head (or the single commit CID when solo) — a real content
+            // hash, deterministic and stable across restarts for the same state.
+            return store.getRevision();
         },
     },
 
@@ -291,7 +298,6 @@ export const {
     isPublic,
     init,
     teardown,
-    interactions,
     perspectiveCommit,
     perspectiveSyncSync,
     perspectiveSyncRender,
@@ -333,7 +339,11 @@ export function linkSyncAddSyncStateChangeCallback(callback: (state: string) => 
 /**
  * Handle signals emitted by the executor.
  *
- * The executor may forward inbound data as signals to the language.
+ * The executor may forward an inbound record from a peer repo (triple add or
+ * tombstone removal) as a signal. We ingest it into that peer's repo state
+ * (the cross-repo OR-Set substrate), then emit the resulting fold delta — the
+ * links that entered or left the materialised set. Convergence is the OR-Set
+ * union, not a direct apply of the inbound link.
  */
 export async function handleSignal(signalData: string): Promise<void> {
     let signal: unknown;
@@ -343,25 +353,37 @@ export async function handleSignal(signalData: string): Promise<void> {
         return; // Not JSON — not our signal
     }
 
-    // Process signal (e.g. inbound record notification)
-    if (typeof signal === "object" && signal !== null) {
-        const s = signal as Record<string, unknown>;
-        if (s.type === "atproto:record") {
-            // A new record notification from the executor
-            const record = s.record as { uri: string; cid: string; value: Record<string, unknown> } | undefined;
-            if (record) {
-                const { recordToLink } = await import("./src/translate.js");
-                const uriParts = record.uri.replace("at://", "").split("/");
-                const authorDid = uriParts[0] || "";
-                const link = recordToLink(record.value, authorDid, record.uri, neighbourhoodUrl());
-                if (link) {
-                    const diff: PerspectiveDiff = { additions: [link], removals: [] };
-                    store.applyDiff(diff);
-                    if (linkCallback) {
-                        linkCallback(diff);
-                    }
-                }
-            }
-        }
-    }
+    if (typeof signal !== "object" || signal === null) return;
+    const s = signal as Record<string, unknown>;
+    if (s.type !== "atproto:record") return;
+
+    const record = s.record as { uri: string; cid: string; value: Record<string, unknown> } | undefined;
+    if (!record) return;
+
+    const { splitPath } = await import("./src/mst.js");
+    const stripped = record.uri.replace("at://", "");
+    const slash = stripped.indexOf("/");
+    const authorDid = slash >= 0 ? stripped.slice(0, slash) : stripped;
+    const pathPart = slash >= 0 ? stripped.slice(slash + 1) : "";
+    const { collection, rkey } = splitPath(pathPart);
+    if (!authorDid || !collection || !rkey) return;
+
+    // Snapshot before → ingest into the peer repo → snapshot after → emit delta.
+    const before = new Map(store.foldLinks().map((l) => [store.hashLink(l), l] as const));
+    store.ingestPeerRecords(
+        authorDid,
+        [{ collection, rkey, value: record.value }],
+        [],
+        record.cid || null,
+    );
+    const after = new Map(store.foldLinks().map((l) => [store.hashLink(l), l] as const));
+
+    const additions: LinkExpression[] = [];
+    const removals: LinkExpression[] = [];
+    for (const [h, l] of after) if (!before.has(h)) additions.push(l);
+    for (const [h, l] of before) if (!after.has(h)) removals.push(l);
+
+    if (additions.length === 0 && removals.length === 0) return;
+    const diff: PerspectiveDiff = { additions, removals };
+    if (linkCallback) linkCallback(diff);
 }
