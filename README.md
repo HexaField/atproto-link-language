@@ -196,6 +196,29 @@ on a shared repo (record keys are now the OR-Set content hash, not a
 timestamp-derived TID). Both are regression-guarded (`tests/sync.test.ts`,
 `tests/translate.test.ts`) and documented in `AGENTS.md`.
 
+### Role B — verified live against a real PDS (native XRPC read-back)
+
+Channel B was **separately verified** against a live Bluesky reference PDS. This
+language's own projection wrote an `app.bsky.feed.post` via
+`com.atproto.repo.applyWrites`, and the record was read back via
+`com.atproto.repo.getRecord` / `listRecords` as a **clean post** — `text` equals
+the message, a valid TID record-key, and **no `ad4m` envelope** in the record.
+That is a genuine live native-read: the language emitted a real Bluesky record
+and a real PDS accepted and returned it.
+
+This run found and fixed a **real bug** the co-located C1 model had hidden: the
+Channel-B rkey was `bsky-${tidNow()}`, which a modern PDS rejects because
+`app.bsky.feed.post`'s Lexicon pins `key: tid` — the record key MUST be a bare
+TID. Fixed to a bare `tidNow()` with two regression tests (`tests/xrpc.test.ts`),
+landed to `main`.
+
+**What is not yet shown:** rendering in an **official Bluesky app** (the
+`social-app` GUI). That needs an AppView indexer plus a resolvable `did:plc`
+served through PLC — external infrastructure beyond this language. So Channel B
+here is **projection-real and native-read-live, but consumer-GUI-pending**: the
+record is valid and a real PDS serves it; putting it in front of a Bluesky end
+user is an infra step, not a language gap.
+
 ### What still needs distinct-repo federation
 
 The C1 model is **co-located** — both agents share one provisioned DID and repo, so
