@@ -85,6 +85,30 @@ describe("TID generation", () => {
 
         assert.ok(tid1 < tid2);
     });
+
+    // The canonical AT Protocol TID grammar a real PDS enforces for a record key
+    // pinned `key: tid` (e.g. app.bsky.feed.post): 13 chars from the base32-sort
+    // alphabet, first char restricted to [234567abcdefghij] (top bit clear).
+    // See com.atproto.repo record-key validation.
+    const AT_TID_RE = /^[234567abcdefghij][234567a-z]{12}$/;
+
+    it("tidNow() is a valid AT-Protocol record-key TID (the Channel-B post rkey)", () => {
+        // index.ts::projectPostsRoleB keys each projected app.bsky.feed.post with
+        // `tidNow()`. app.bsky.feed.post's Lexicon pins `key: tid`, so a modern PDS
+        // rejects any non-TID rkey. This guards that the generated rkey is a TID.
+        for (let i = 0; i < 50; i++) {
+            const rkey = tidNow();
+            assert.ok(AT_TID_RE.test(rkey), `projected-post rkey "${rkey}" is not a valid AT TID`);
+        }
+    });
+
+    it("a `bsky-`-prefixed rkey is NOT a valid TID (regression: the removed prefix)", () => {
+        // Regression guard for the Role-B write defect: a `bsky-${tidNow()}` rkey
+        // was rejected by the PDS with `InvalidRequest: Invalid record key for
+        // app.bsky.feed.post: Invalid TID string`. Prove that historical form fails
+        // the exact grammar, so the prefix is never reintroduced.
+        assert.equal(AT_TID_RE.test(`bsky-${tidNow()}`), false);
+    });
 });
 
 // ---------------------------------------------------------------------------

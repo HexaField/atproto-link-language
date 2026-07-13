@@ -286,10 +286,15 @@ async function projectPostsRoleB(diff: PerspectiveDiff): Promise<void> {
     }
 
     for (const p of projected) {
-        // A distinct, deterministic-ish rkey per projected instance. The post is
-        // a derived render (not an OR-Set element), so any unique rkey is fine;
-        // we prefix to keep it clearly separate from substrate record keys.
-        const rkey = `bsky-${tidNow()}`;
+        // A distinct rkey per projected instance. The post is a derived render
+        // (not an OR-Set element), so any unique rkey is fine — EXCEPT that
+        // `app.bsky.feed.post`'s Lexicon pins `key: tid`, so the rkey MUST be a
+        // bare TID: a modern PDS rejects a non-TID rkey (e.g. a `bsky-`-prefixed
+        // one) with `InvalidRequest: Invalid record key … Invalid TID string`.
+        // rkeys are scoped per collection, and posts live in `app.bsky.feed.post`
+        // while the substrate lives in `ad4m.link.*`, so a bare TID never
+        // collides with a substrate record key.
+        const rkey = tidNow();
         const result = await xrpc.applyWrites(AT_PDS_URL, auth.accessJwt, auth.did, [
             {
                 $type: "com.atproto.repo.applyWrites#create",

@@ -92,3 +92,13 @@ rendering in Bluesky**.
 - The AT Proto firehose is one-way, so there is no telepresence channel — do not
   claim presence support.
 - `src/projection/` is shared — edit here and propagate, never fork.
+- **Channel-B post rkeys must be bare TIDs.** `app.bsky.feed.post`'s Lexicon pins
+  `key: tid`, so a modern PDS (`@atproto/pds` ≥ 0.5.x) rejects any non-TID record
+  key with `InvalidRequest: Invalid record key for app.bsky.feed.post: Invalid
+  TID string`. `projectPostsRoleB` therefore keys projections with a bare
+  `tidNow()` — never a prefixed/derived string. Older 0.4.x PDS builds did not
+  enforce this, which is why the defect went unseen until a live round-trip on a
+  current PDS. Regression-guarded in `tests/xrpc.test.ts` (TID grammar
+  `/^[234567abcdefghij][234567a-z]{12}$/`). Verified live: the projected record
+  is written via `applyWrites#create` and read back natively via
+  `com.atproto.repo.getRecord` / `listRecords` as a clean post (no ad4m envelope).
