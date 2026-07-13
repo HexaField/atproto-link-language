@@ -80,6 +80,15 @@ rendering in Bluesky**.
 
 ## Gotchas
 
+- **The executor discards `sync()`'s return value.** `Language::sync()` runs the
+  handler purely for side effects; a folded peer delta becomes queryable via
+  `perspective.queryLinks` **only** when pushed through the host's
+  `emitPerspectiveDiff` channel. Folding into the local store keeps `render()` /
+  `currentRevision()` correct but leaves peer links invisible to the executor's
+  perspective — a silent add-freeze under multi-agent convergence. Both `init()`
+  and the sync handler route through `foldAndEmit` (`src/sync.ts`), the single
+  seam that folds **and** emits; keep it that way. Regression-guarded in
+  `tests/sync.test.ts`.
 - The AT Proto firehose is one-way, so there is no telepresence channel — do not
   claim presence support.
 - `src/projection/` is shared — edit here and propagate, never fork.

@@ -218,15 +218,16 @@ export function diffToWriteOps(
     hashFn: (data: string) => string,
 ): RepoWrite[] {
     const writes: RepoWrite[] = [];
-    const usedRkeys = new Set<string>();
+    const seen = new Set<string>();
 
     for (const link of diff.additions) {
-        let rkey = linkToRkey(link);
-        while (usedRkeys.has(rkey)) {
-            const hash = hashFn(JSON.stringify(link) + rkey);
-            rkey = rkey.substring(0, 10) + hash.substring(0, 3);
-        }
-        usedRkeys.add(rkey);
+        // The rkey is the link's OR-Set element hash — content-addressed, so it
+        // is unique per distinct link and identical for the same link across
+        // agents. A timestamp-derived rkey collides when two distinct links
+        // share a millisecond (see linkHash / translateDiffToWrites).
+        const rkey = linkHash(link, hashFn);
+        if (seen.has(rkey)) continue; // identical element already written this batch
+        seen.add(rkey);
 
         const record = linkToTripleRecord(link);
         writes.push({
@@ -238,7 +239,7 @@ export function diffToWriteOps(
     }
 
     for (const link of diff.removals) {
-        const rkey = linkToRkey(link);
+        const rkey = linkHash(link, hashFn);
         writes.push({
             $type: "com.atproto.repo.applyWrites#delete",
             collection,
@@ -582,22 +583,26 @@ export function translateDiffToWrites(
     opts: CommitOptions,
 ): RepoWrite[] {
     const writes: RepoWrite[] = [];
-    const usedRkeys = new Set<string>();
+    const seen = new Set<string>();
     const { settings, hashFn, shouldFederate, collection } = opts;
     const strategy = settings.rendering.strategy;
 
     for (const link of diff.additions) {
-        const linkHash = hashFn(linkContentKey(link));
+        const originHash = hashFn(linkContentKey(link));
 
         // Check federation filter
-        if (!shouldFederate(linkHash)) continue;
+        if (!shouldFederate(originHash)) continue;
 
-        let rkey = linkToRkey(link);
-        while (usedRkeys.has(rkey)) {
-            const h = hashFn(JSON.stringify(link) + rkey);
-            rkey = rkey.substring(0, 10) + h.substring(0, 3);
-        }
-        usedRkeys.add(rkey);
+        // The record key is the link's OR-Set element hash — content-addressed,
+        // so it is unique per distinct link and identical for the same link
+        // across agents. A timestamp-derived TID rkey collides when two distinct
+        // links share a millisecond, and when two co-located agents write to one
+        // repo the second create is rejected → silent link loss under
+        // convergence. The hash also matches the tombstone's key (see the
+        // removal branch below) so an add and its delete co-locate.
+        const rkey = linkHash(link, hashFn);
+        if (seen.has(rkey)) continue; // identical element already written this batch
+        seen.add(rkey);
 
         // Native triple
         if (strategy === "native" || strategy === "dual") {
@@ -620,7 +625,6 @@ export function translateDiffToWrites(
                 if (text) {
                     const facets = generateFacets(text);
                     const bskyRkey = `bsky-${rkey}`;
-                    usedRkeys.add(bskyRkey);
 
                     const post = linkToBlueskyPost(link, { text, facets });
                     writes.push({
@@ -638,7 +642,10 @@ export function translateDiffToWrites(
         const originHash = hashFn(linkContentKey(link));
         if (!shouldFederate(originHash)) continue;
 
-        const rkey = linkToRkey(link);
+        // Same content-addressed rkey the add used, so the delete targets the
+        // exact triple record that was created (matches across proof-stripping:
+        // removeLink hands us an empty-proof link, and linkHash excludes proof).
+        const rkey = linkHash(link, hashFn);
 
         if (strategy === "native" || strategy === "dual") {
             // First-class removal: write an ad4m.link.tombstone record carrying

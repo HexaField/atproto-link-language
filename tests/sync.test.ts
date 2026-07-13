@@ -22,7 +22,7 @@ import { initSigning } from "../src/adapters.js";
 import type { SigningAdapter } from "../src/adapters.js";
 
 import * as store from "../src/store.js";
-import { diffRepoRecords, syncAll, syncRepo, type ObservedRecord } from "../src/sync.js";
+import { diffRepoRecords, syncAll, syncRepo, foldAndEmit, type ObservedRecord } from "../src/sync.js";
 import { recordCid, recordPath } from "../src/mst.js";
 import { TRIPLE_COLLECTION, TOMBSTONE_COLLECTION } from "../src/lexicon.js";
 import type { LinkExpression } from "../src/types.js";
@@ -69,9 +69,12 @@ function simpleHash(data: string): string {
 }
 
 class MockRuntime implements RuntimeAdapter {
+    public emitted: Array<{ additions: unknown[]; removals: unknown[] }> = [];
     hash(data: string) { return simpleHash(data); }
     emitSignal() {}
-    emitPerspectiveDiff() {}
+    emitPerspectiveDiff(diff: unknown) {
+        this.emitted.push(diff as { additions: unknown[]; removals: unknown[] });
+    }
 }
 
 class MockSigning implements SigningAdapter {
@@ -85,13 +88,15 @@ class MockSigning implements SigningAdapter {
 
 let mockStorage: MockStorage;
 let mockTransport: MockTransport;
+let mockRuntime: MockRuntime;
 
 beforeEach(() => {
     mockStorage = new MockStorage();
     mockTransport = new MockTransport();
+    mockRuntime = new MockRuntime();
     initStorage(mockStorage);
     initTransport(mockTransport);
-    initRuntime(new MockRuntime());
+    initRuntime(mockRuntime);
     initSigning(new MockSigning());
     store.initStore(simpleHash);
 });
@@ -237,5 +242,44 @@ describe("syncAll", () => {
         const diff = await syncAll({ pdsUrl: "https://pds", accessJwt: "jwt", repo: "did:plc:self" });
         assert.equal(diff.additions.length, 0);
         assert.equal(diff.removals.length, 0);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// foldAndEmit — the host-channel emit contract
+//
+// Regression guard for the C1 A=10/B=10 freeze: the executor discards the sync
+// handler's return value, so a folded peer delta only becomes queryable when it
+// is pushed through emitPerspectiveDiff. foldAndEmit is the single seam that
+// must do that; syncAll returning the delta is NOT enough on its own.
+// ---------------------------------------------------------------------------
+
+describe("foldAndEmit", () => {
+    it("emits the folded delta through the host channel, not merely returns it", async () => {
+        wireRepo("bafyself", [
+            { uri: "at://did:plc:self/ad4m.link.triple/r1", cid: "c1", value: tripleRecord("literal://hello") },
+        ]);
+
+        const delta = await foldAndEmit({ pdsUrl: "https://pds", accessJwt: "jwt", repo: "did:plc:self" });
+
+        // Returned delta is correct...
+        assert.equal(delta.additions.length, 1);
+        // ...AND — the part the executor actually reads — it was EMITTED.
+        assert.equal(mockRuntime.emitted.length, 1, "a non-empty fold must emit exactly once");
+        assert.equal(mockRuntime.emitted[0].additions.length, 1);
+        assert.equal(
+            (mockRuntime.emitted[0].additions[0] as LinkExpression).data.source,
+            "literal://hello",
+        );
+    });
+
+    it("does not emit when the fold produces an empty delta (no churn)", async () => {
+        wireRepo("bafyempty", []);
+
+        const delta = await foldAndEmit({ pdsUrl: "https://pds", accessJwt: "jwt", repo: "did:plc:self" });
+
+        assert.equal(delta.additions.length, 0);
+        assert.equal(delta.removals.length, 0);
+        assert.equal(mockRuntime.emitted.length, 0, "an empty fold must not emit");
     });
 });

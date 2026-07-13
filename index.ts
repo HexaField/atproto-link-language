@@ -47,7 +47,7 @@ import * as store from "./src/store.js";
 import * as xrpc from "./src/xrpc.js";
 import { tidNow } from "./src/xrpc.js";
 import { authenticate, getAccessToken } from "./src/auth.js";
-import { syncAll } from "./src/sync.js";
+import { foldAndEmit } from "./src/sync.js";
 import { TRIPLE_COLLECTION } from "./src/lexicon.js";
 
 // Channel-B (Role B) projection — SHACL-driven native ⇄ graph transform.
@@ -421,16 +421,14 @@ const language = defineLanguage({
                 if (auth) {
                     console.log(`[atproto-link-language] authenticated as ${auth.did}`);
                     store.setLocalDid(auth.did);
-                    // Initial convergence: ride each repo's commit head via MST diff.
+                    // Initial convergence: ride each repo's commit head via MST
+                    // diff, then emit the fold through the host channel.
                     if (settings.syncMode !== "publish-only") {
-                        const diff = await syncAll({
+                        await foldAndEmit({
                             pdsUrl: AT_PDS_URL,
                             accessJwt: auth.accessJwt,
                             repo: auth.did,
                         });
-                        if (diff.additions.length > 0 || diff.removals.length > 0) {
-                            emitPerspectiveDiff(diff);
-                        }
                     }
                 } else {
                     console.error("[atproto-link-language] authentication failed — no session returned");
@@ -506,18 +504,28 @@ const language = defineLanguage({
                 return { additions: [], removals: [] };
             }
 
-            // Channel A — fold the authoritative substrate.
-            const diff = await syncAll({
+            // Channel A — fold the authoritative substrate AND push the delta
+            // through emitPerspectiveDiff. The executor discards this handler's
+            // return value, so a returned-but-unemitted fold leaves peer links
+            // invisible to queryLinks (the A=10/B=10 freeze); foldAndEmit closes
+            // that loop. See src/sync.ts.
+            const diff = await foldAndEmit({
                 pdsUrl: AT_PDS_URL,
                 accessJwt: auth.accessJwt,
                 repo: auth.did,
             });
 
             // Channel B — ingest pure-Bluesky posts into Channel A as new links.
+            // Native ingests are published back onto Channel A, so they surface
+            // (and emit) on the next fold; combine them into the return for any
+            // caller that does consume it.
             const ingested = await ingestNativePosts();
 
             if (ingested.additions.length === 0 && ingested.removals.length === 0) {
                 return diff;
+            }
+            if (ingested.additions.length > 0 || ingested.removals.length > 0) {
+                emitPerspectiveDiff(ingested);
             }
             return {
                 additions: [...diff.additions, ...ingested.additions],

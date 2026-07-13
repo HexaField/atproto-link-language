@@ -238,6 +238,28 @@ export async function syncAll(opts: SyncOptions): Promise<PerspectiveDiff> {
     return diffSnapshots(before, snapshotLinks());
 }
 
+/**
+ * Fold the authoritative substrate (Channel A) AND push the resulting delta
+ * through the host's `emitPerspectiveDiff` channel.
+ *
+ * This is the seam that makes folded peer links QUERYABLE. The executor runs
+ * `perspectiveSyncSync()` purely for side effects and DISCARDS its return value,
+ * so a delta that is only *returned* (never emitted) leaves peer links invisible
+ * to `perspective.queryLinks` — the A=N/B=N convergence freeze. `syncAll` already
+ * folds the delta into the local store (so `render()`/`currentRevision()` are
+ * correct without this), but the emit is what closes the loop to the executor's
+ * perspective. Both `init()` and the sync handler route through here so the
+ * host contract lives in one unit-testable place — the same trap bit
+ * Nostr, Hypercore, and Solid.
+ */
+export async function foldAndEmit(opts: SyncOptions): Promise<PerspectiveDiff> {
+    const delta = await syncAll(opts);
+    if (delta.additions.length > 0 || delta.removals.length > 0) {
+        getRuntime().emitPerspectiveDiff(delta);
+    }
+    return delta;
+}
+
 // ---------------------------------------------------------------------------
 // OR-Set convergence delta
 // ---------------------------------------------------------------------------

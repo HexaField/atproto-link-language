@@ -148,8 +148,13 @@ Requires `@coasys/ad4m-ldk` at `../ad4m/ad4m-ldk/js/` or set `AD4M_LDK_ENTRY`.
 node --experimental-vm-modules --import tsx --test tests/*.test.ts
 ```
 
-326 tests across 15 test files, all passing. The convergence core is unit-tested
+331 tests across 15 test files, all passing. The convergence core is unit-tested
 against fixtures:
+
+- `tests/translate.test.ts` — link ↔ record translation, incl. **content-addressed
+  rkeys**: distinct same-millisecond links get distinct rkeys across independent
+  batches (a cross-agent collision guard), the same link is idempotent, and an add
+  and its removal target the same rkey so the delete hits the created record.
 
 - `tests/cid.test.ts` — DAG-CBOR / sha-256 / CIDv1, incl. the empty-map
   known-answer CID.
@@ -160,7 +165,9 @@ against fixtures:
   DAG-authoritative fold, cross-repo removal convergence, add-after-remove,
   concurrent remove-wins, order-independent merge, projection-derived-by-fold.
 - `tests/sync.test.ts` — the MST-diff sync layer (`diffRepoRecords`, `syncRepo`
-  head-riding + unchanged-head skip, `syncAll` fold delta).
+  head-riding + unchanged-head skip, `syncAll` fold delta) and the `foldAndEmit`
+  host-channel contract (a non-empty fold must be *emitted* through
+  `emitPerspectiveDiff`, not merely returned — the executor discards the return).
 - `tests/projection.test.ts` — the Channel-B SHACL stack: literal codec, node
   expressions, `parseProfiles`, instance collection + projection, native
   round-trip, and the ATProto adapter (`toNative` emits a clean
@@ -169,20 +176,37 @@ against fixtures:
   (`toAuthoredLink`, `projectInstances`, `ingestNative`, the Flux fallback
   profile) exercised over the ATProto post adapter.
 
-### What needs a live PDS / federation
+### Verified live against a real PDS (co-located C1)
 
-A live PDS cannot run in this test environment, so the following are exercised
-only at the request-building / response-parsing level, not end-to-end:
+The AD4M wind-tunnel C1 scenario runs this language end-to-end against a **live
+Bluesky reference PDS** (`pds` 0.4.x): two executors each write 10 links, and the
+harness proves convergence via each executor's own `queryLinks`. **Both agents
+reached 20/20 links in 4.05 s and a removal converged in 3.05 s.** This exercises,
+for real, what the unit suite can only mock:
 
-- **Wire fetches:** `com.atproto.sync.getLatestCommit` and `listRecords` HTTP
-  round-trips against a real PDS (mocked here via an injected `Transport`).
-- **Record write-back:** `createRecord` / `deleteRecord` actually persisting to a
-  PDS and advancing the *server's* commit head.
-- **Cross-agent federation:** two agents on distinct PDS repos observing each
-  other's heads via a relay firehose and converging.
+- **Wire fetches** — `com.atproto.sync.getLatestCommit` / `listRecords` against
+  the server.
+- **Record write-back** — `com.atproto.repo.applyWrites` persisting triple and
+  tombstone records and advancing the server's commit head.
 
-The convergence *logic* those flows drive — commit-CID computation, MST diffing,
-OR-Set union, and the fold — is fully unit-tested against fixtures above.
+The live run surfaced two defects the fixtures could not: the executor **discards
+`sync()`'s return value** (peer folds must be pushed through `emitPerspectiveDiff`,
+now funnelled via the `foldAndEmit` seam), and a **same-millisecond rkey collision**
+on a shared repo (record keys are now the OR-Set content hash, not a
+timestamp-derived TID). Both are regression-guarded (`tests/sync.test.ts`,
+`tests/translate.test.ts`) and documented in `AGENTS.md`.
+
+### What still needs distinct-repo federation
+
+The C1 model is **co-located** — both agents share one provisioned DID and repo, so
+convergence rides a single MST commit chain. Genuinely federated operation is
+therefore still only unit-tested, not run end-to-end:
+
+- **Cross-agent federation:** two agents on **distinct** PDS repos observing each
+  other's heads via a relay firehose and converging by cross-repo OR-Set union.
+
+The convergence *logic* that flow drives — commit-CID computation, MST diffing,
+cross-repo OR-Set union, and the fold — is fully unit-tested against fixtures above.
 
 ## Module Layout
 

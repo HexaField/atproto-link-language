@@ -461,6 +461,56 @@ describe("diffToWriteOps", () => {
 });
 
 // ---------------------------------------------------------------------------
+// rkey is content-addressed — cross-agent collision safety
+//
+// Regression guard for the C1 A=18/B=18 partial-convergence freeze. Two
+// co-located agents (same DID, one shared repo) each build their OWN write
+// batch. A timestamp-derived TID rkey collides when two DISTINCT links share a
+// millisecond: each agent's batch de-dups only against itself, so both emit the
+// same TID, and the second `applyWrites#create` on the shared repo is rejected
+// → that link is silently lost (the harness saw 18 of 20 land). The rkey must
+// be the link's OR-Set content hash: unique per distinct link, identical for
+// the same link across agents, and matching between an add and its removal.
+// ---------------------------------------------------------------------------
+
+describe("rkey content-addressing (cross-agent collision safety)", () => {
+    it("distinct same-timestamp links get distinct rkeys across independent batches", () => {
+        // Same millisecond, different content — the exact shape that collided.
+        const ts = "2026-05-02T00:00:00.000Z";
+        const a = makeLinkExpression({ timestamp: ts, data: { source: "s", predicate: "p", target: "literal://a-0" } });
+        const b = makeLinkExpression({ timestamp: ts, data: { source: "s", predicate: "p", target: "literal://b-0" } });
+
+        // Separate batches = two agents; each has its own de-dup state.
+        const opsA = diffToWriteOps({ additions: [a], removals: [] }, "ad4m.link.triple", simpleHash);
+        const opsB = diffToWriteOps({ additions: [b], removals: [] }, "ad4m.link.triple", simpleHash);
+
+        assert.notEqual(
+            (opsA[0] as { rkey: string }).rkey,
+            (opsB[0] as { rkey: string }).rkey,
+            "distinct same-timestamp links must not share an rkey on a shared repo",
+        );
+    });
+
+    it("the same link yields the same rkey across independent batches (idempotent co-location)", () => {
+        const link = makeLinkExpression({ timestamp: "2026-05-02T00:00:00.000Z" });
+        const ops1 = diffToWriteOps({ additions: [link], removals: [] }, "ad4m.link.triple", simpleHash);
+        const ops2 = diffToWriteOps({ additions: [link], removals: [] }, "ad4m.link.triple", simpleHash);
+        assert.equal((ops1[0] as { rkey: string }).rkey, (ops2[0] as { rkey: string }).rkey);
+    });
+
+    it("an add and its removal target the same rkey (the delete hits the created record)", () => {
+        const link = makeLinkExpression({ timestamp: "2026-05-02T00:00:00.000Z" });
+        const addOps = diffToWriteOps({ additions: [link], removals: [] }, "ad4m.link.triple", simpleHash);
+        const delOps = diffToWriteOps({ additions: [], removals: [link] }, "ad4m.link.triple", simpleHash);
+        assert.equal(
+            (addOps[0] as { rkey: string }).rkey,
+            (delOps[0] as { rkey: string }).rkey,
+            "removal must delete the exact record the add created",
+        );
+    });
+});
+
+// ---------------------------------------------------------------------------
 // recordToLink (dispatch by $type)
 // ---------------------------------------------------------------------------
 
